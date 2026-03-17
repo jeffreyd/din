@@ -57,9 +57,26 @@ void runJob(ref DownloadJob job, NntpPool pool,
 
     import std.stdio : File;
     auto f = File(outPath, "wb");
-    foreach (chunk; chunks)
+    // Write chunks in order.  Missing parts (empty chunk) are zero-padded so
+    // subsequent parts land at the correct file offset.
+    foreach (i, chunk; chunks)
+    {
         if (chunk.length > 0)
+        {
             f.rawWrite(chunk);
+        }
+        else if (job.post.messageIds[i].length > 0)
+        {
+            // Part was present in the index but failed to download — pad with zeros.
+            // We don't know the exact size, so use the average segment size.
+            ulong avgSize = job.post.totalBytes > 0 && job.post.totalParts > 0
+                          ? job.post.totalBytes / job.post.totalParts
+                          : 768_000;   // ~750 KB fallback
+            ubyte[] pad = new ubyte[](cast(size_t) avgSize);
+            f.rawWrite(pad);
+        }
+        // Empty msgId (truly missing part) — skip entirely, nothing we can do.
+    }
     f.close();
 
     job.decodedFiles ~= outPath;
@@ -69,12 +86,19 @@ void runJob(ref DownloadJob job, NntpPool pool,
 
 private string sanitizeFname(string name)
 {
-    string s = name;
-    if (s.length >= 2 && s[0] == '"' && s[$-1] == '"')
-        s = s[1 .. $-1];
+    import std.string : strip, lastIndexOf, indexOf;
 
-    import std.string : strip;
-    s = s.strip;
+    // Prefer the last "quoted.ext" string in the subject — that's almost
+    // always the actual filename (e.g. 'Some Title - "file.mp3"').
+    string s = extractQuotedFilename(name);
+    if (s.length == 0)
+    {
+        // Fall back to the full baseName, stripping outer quotes.
+        s = name;
+        if (s.length >= 2 && s[0] == '"' && s[$-1] == '"')
+            s = s[1 .. $-1];
+        s = s.strip;
+    }
 
     auto app = appender!string;
     foreach (dchar c; s)
@@ -89,4 +113,23 @@ private string sanitizeFname(string name)
     if (result.length > 0 && result[0] == '.')
         result = "_" ~ result[1 .. $];
     return result.length > 0 ? result : "download";
+}
+
+/// Find the last "quoted string" in s that looks like a filename (has a dot,
+/// no path separators).  Returns "" if nothing suitable is found.
+private string extractQuotedFilename(string name)
+{
+    import std.string : lastIndexOf, indexOf;
+
+    long e = lastIndexOf(name, '"');
+    if (e <= 0) return "";
+    long b = lastIndexOf(name[0 .. cast(size_t) e], '"');
+    if (b < 0) return "";
+
+    string candidate = name[cast(size_t)(b + 1) .. cast(size_t) e];
+    if (candidate.length == 0)                   return "";
+    if (indexOf(candidate, '.') < 0)             return "";  // no extension
+    if (indexOf(candidate, '/') >= 0)            return "";  // path separator
+    if (indexOf(candidate, '\\') >= 0)           return "";
+    return candidate;
 }
