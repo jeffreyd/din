@@ -237,7 +237,7 @@ int runThreadList(Group group, ThreadItem[] items, int startAt,
         fillLine(rows - 1, sa, cols);
         attron(sa);
         string hint = statusMsg.length > 0 ? statusMsg
-            : "j/k:move  g/G:top/bot  /:search  n:next  d:download  D:queue  Enter:open  q:back";
+            : "j/k:move  g/G:top/bot  /:search  n:next  d:dl  D:queue  A:fetch-all  Enter:open  q:back";
         if (cast(int) hint.length > cols - 2)
             hint = hint[0 .. cols - 2];
         mvprint(rows - 1, 2, hint);
@@ -292,8 +292,9 @@ int runThreadList(Group group, ThreadItem[] items, int startAt,
                 runDownloader(queue);
                 break;
 
-            case Action.Back:  return -1;
-            case Action.Quit:  return -2;
+            case Action.FetchAll: return -3;
+            case Action.Back:     return -1;
+            case Action.Quit:     return -2;
 
             case Action.Search:
             {

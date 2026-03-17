@@ -176,6 +176,25 @@ int main(string[] args)
             if (result == -2) break outer;
             if (result == -1) break;
 
+            if (result == -3)
+            {
+                // User pressed A — fetch all headers from the beginning.
+                showLoading("Fetching all headers for " ~ group.name ~ " ...");
+                try
+                {
+                    headers = syncHeaders(client, cfg, server, group.name,
+                                         /*fetchAll=*/true);
+                }
+                catch (Exception e)
+                {
+                    showError("Error: " ~ e.msg);
+                    continue;
+                }
+                showLoading("Assembling thread list...");
+                items = assemble(headers);
+                continue;
+            }
+
             threadCursor = result;
 
             auto item = items[result];
@@ -214,7 +233,8 @@ int main(string[] args)
 // Returns all headers for the group (cached + new).
 private Header[] syncHeaders(
     NntpClient client, ref AppConfig cfg,
-    ref ServerConfig server, string groupName)
+    ref ServerConfig server, string groupName,
+    bool fetchAll = false)
 {
     string cpath = cachePath(cfg.options.cacheDir, server.name, groupName);
     string ipath = indexPath(cfg.options.cacheDir, server.name, groupName);
@@ -222,17 +242,20 @@ private Header[] syncHeaders(
     auto idx  = readIndex(ipath);
     auto info = client.selectGroup(groupName);
 
-    if (info.last > idx.watermark)
-    {
-        long from = (idx.watermark > 0)
+    long from;
+    if (fetchAll)
+        from = info.first;
+    else if (info.last > idx.watermark)
+        from = (idx.watermark > 0)
             ? idx.watermark + 1
-            : max(info.first, info.last - 1_000 + 1);   // initial: last 1000
+            : max(info.first, info.last - 10_000 + 1);  // initial: last 10000
+    else
+        from = info.last + 1;  // nothing new
 
-        if (from <= info.last)
-        {
-            auto fresh = client.fetchHeaders(from, info.last);
-            appendHeaders(cpath, ipath, fresh);
-        }
+    if (from <= info.last)
+    {
+        auto fresh = client.fetchHeaders(from, info.last);
+        appendHeaders(cpath, ipath, fresh);
     }
 
     return loadHeaders(cpath);

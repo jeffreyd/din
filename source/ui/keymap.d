@@ -20,6 +20,7 @@ enum Action
     SearchNext,
     Download,
     ShowDownloader,
+    FetchAll,
 }
 
 Action keyToAction(int ch)
@@ -41,6 +42,7 @@ Action keyToAction(int ch)
         case 'n':                                return Action.SearchNext;
         case 'd':                                return Action.Download;
         case 'D':                                return Action.ShowDownloader;
+        case 'A':                                return Action.FetchAll;
         default:                                 return Action.None;
     }
 }
