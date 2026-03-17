@@ -29,6 +29,10 @@ void runJob(ref DownloadJob job, NntpPool pool,
     ubyte[][] chunks;
     chunks.length = totalSegs;
 
+    // yEnc name= from the first successfully decoded segment; preferred over
+    // the subject-derived baseName (same priority as Pan/uulib).
+    string yencName;
+
     foreach (idx, msgId; msgIds)
     {
         if (msgId.length == 0) continue;
@@ -38,44 +42,35 @@ void runJob(ref DownloadJob job, NntpPool pool,
             string body = pool.fetchBody(msgId);
             auto   res  = decodeYenc(body);
             chunks[idx] = res.data;
+            if (yencName.length == 0 && res.info.name.length > 0)
+                yencName = res.info.name;
             job.progress.segmentDone(res.data.length);
             if (onProgress) onProgress();
         }
         catch (Exception e)
         {
-            job.state = JobState.Failed;
+            // Failed segment: leave chunks[idx] empty and continue.
+            // The incomplete file is still useful for par2 repair.
             job.error = "Part " ~ (idx + 1).to!string ~ ": " ~ e.msg;
-            return;
+            if (onProgress) onProgress();
         }
     }
 
     job.state = JobState.Decoding;
     if (onProgress) onProgress();
 
-    string fname   = sanitizeFname(job.post.baseName);
+    // Prefer yEnc name= header; fall back to subject-derived baseName.
+    string fname   = sanitizeFname(yencName.length > 0 ? yencName : job.post.baseName);
     string outPath = buildPath(job.destDir, fname);
 
     import std.stdio : File;
     auto f = File(outPath, "wb");
-    // Write chunks in order.  Missing parts (empty chunk) are zero-padded so
-    // subsequent parts land at the correct file offset.
-    foreach (i, chunk; chunks)
+    // Write only the parts we have.  Missing parts are skipped entirely —
+    // the resulting incomplete file is still useful for par2 repair.
+    foreach (chunk; chunks)
     {
         if (chunk.length > 0)
-        {
             f.rawWrite(chunk);
-        }
-        else if (job.post.messageIds[i].length > 0)
-        {
-            // Part was present in the index but failed to download — pad with zeros.
-            // We don't know the exact size, so use the average segment size.
-            ulong avgSize = job.post.totalBytes > 0 && job.post.totalParts > 0
-                          ? job.post.totalBytes / job.post.totalParts
-                          : 768_000;   // ~750 KB fallback
-            ubyte[] pad = new ubyte[](cast(size_t) avgSize);
-            f.rawWrite(pad);
-        }
-        // Empty msgId (truly missing part) — skip entirely, nothing we can do.
     }
     f.close();
 

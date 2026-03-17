@@ -18,8 +18,8 @@ and can be queued for download with a single keypress.
   list; no mode-switching, no separate "binary groups"
 - **Multipart grouping** — individual segments of a binary post are detected
   and collapsed into one line showing `[12/12]` completion
-- **Parallel downloads** — configurable connection pool fetches segments
-  concurrently; progress visible in an overlay panel
+- **Downloads** — segments are fetched sequentially with a live progress
+  overlay; missing or failed segments are skipped so par2 can repair the result
 - **yEnc decoding** — single- and multi-part yEnc with CRC32 verification
 - **par2 integration** — automatic verify and repair after download if par2
   files are present; shells out to the system `par2` binary
@@ -175,10 +175,13 @@ entry. The entry shows:
 ```
 
 Pressing `Enter` or `d` on such an entry queues all segments for download.
-`din` opens as many parallel NNTP connections as configured, fetches segments
-concurrently, decodes each yEnc segment, assembles the parts in order, and
-then (if `auto_par2 = true`) runs `par2 verify` and `par2 repair` as needed.
-Completed files land in `download_dir`.
+`din` fetches each segment in order, decodes the yEnc data, and assembles the
+parts into the final file. The filename comes from the yEnc `name=` header when
+present, falling back to the subject line. If any segments fail, they are
+skipped rather than zero-padded — the incomplete file is still useful for
+`par2 repair`. After assembly, if `auto_par2 = true`, `din` runs
+`par2 verify` and `par2 repair` as needed. Completed files land in
+`download_dir`.
 
 ### NZB files
 

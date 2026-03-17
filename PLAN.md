@@ -177,6 +177,7 @@ struct DownloadJob {
 - Parse `=ybegin`, `=ypart`, `=yend` markers
 - Decode body: `byte = (encoded_byte - 42) mod 256`, escape handling for `=`
 - Validate CRC32 against `=yend crc32=` field
+- `=ybegin name=` is the authoritative filename source; subject-derived name is the fallback
 - Multi-part: accumulate decoded chunks, reassemble in order after all segments downloaded
 - Output raw file to configured download directory
 
@@ -307,10 +308,10 @@ editor       = $VISUAL
 [BODY <msgid>] → raw yEnc text
         │
         ▼
-[yenc.decode()] → binary chunk written to temp file
-        │
+[yenc.decode()] → binary chunk; extract name= for filename
+        │  failed segment → skip (leave gap); continue — par2 can repair
         ▼  (all segments done)
-[Assembler joins chunks in part order]
+[Assembler writes present chunks in order; filename = yEnc name= or subject fallback]
         │
         ▼
 [par2 verify / repair if .par2 present]
@@ -395,7 +396,9 @@ editor       = $VISUAL
 | # | Decision | Choice |
 |---|---|---|
 | 1 | Header cache format | Flat binary file (more unix-y, no extra dep) |
-| 2 | Download concurrency | Fibers (lightweight; blocking socket calls wrapped with non-blocking I/O) |
+| 2 | Download concurrency | Single-connection sequential (multi-threaded caused D GC segfaults; Fibers deferred) |
+| 6 | Missing segment handling | Skip and continue — incomplete file is useful for par2 repair (same as Pan) |
+| 7 | Download filename source | yEnc `name=` header preferred; subject-derived baseName is fallback (same as Pan) |
 | 3 | Reply/post in v1 | Out of scope |
 | 4 | TLS library | OpenSSL via `deimos-openssl` |
 | 5 | Binary vs text view | Unified — binary assemblies are entries in the normal thread list, no separate mode |
