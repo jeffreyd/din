@@ -1,0 +1,36 @@
+# D build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# DUB cache and build output
+.dub/
+dub.selections.json
+
+# Compiled binary
+din
+din.exe
+
+# DUB test runner
+__test_runner
+__test_runner.exe
+
+# Code coverage
+*.lst
+
+# Generated docs
+docs/
+
+# macOS
+.DS_Store
+
+# Editor artifacts
+*.swp
+*.swo
+*~
+.#*
+\#*\#

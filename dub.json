@@ -1,0 +1,32 @@
+{
+    "name": "din",
+    "description": "D Interactive Newsreader",
+    "license": "MIT",
+    "targetType": "executable",
+    "targetName": "din",
+    "mainSourceFile": "source/app.d",
+    "sourcePaths": ["source"],
+    "importPaths": ["source"],
+    "dependencies": {
+        "openssl": "~>3.3",
+        "dxml": "~>0.4",
+        "ncurses": "~>1.0"
+    },
+    "libs": ["ssl", "crypto"],
+    "subConfigurations": {
+        "ncurses": "minimal"
+    },
+    "configurations": [
+        {
+            "name": "default"
+        },
+        {
+            "name": "release",
+            "buildOptions": ["releaseMode", "optimize", "inline"]
+        }
+    ],
+    "buildOptions-debug": ["debugMode", "debugInfo"],
+    "lflags-osx": [
+        "-L/opt/homebrew/opt/openssl@3/lib"
+    ]
+}
