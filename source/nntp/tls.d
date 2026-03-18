@@ -10,6 +10,13 @@ import std.conv      : to;
 import nntp.commands : NntpException;
 
 // ---------------------------------------------------------------------------
+// Scheduler hook: set by FiberScheduler.run() to enable fiber-aware I/O.
+// When non-null, fillBuffer/writeLine call this instead of blocking, then
+// call Fiber.yield() so the scheduler can poll other connections.
+// ---------------------------------------------------------------------------
+package void delegate(int fd, bool wantWrite) _schedulerYield;
+
+// ---------------------------------------------------------------------------
 // SSL_set_tlsext_host_name is a macro in OpenSSL — deimos may not expose it
 // directly.  We call SSL_ctrl ourselves with the well-known constants.
 // ---------------------------------------------------------------------------
@@ -34,6 +41,8 @@ private:
     TcpSocket _socket;
     SSL_CTX*  _ctx;
     SSL*      _ssl;
+    int       _fd;
+    bool      _nonBlocking;
 
     ubyte[65_536] _buf;
     size_t        _start;
@@ -60,7 +69,7 @@ public:
         if (_ctx) { SSL_CTX_free(_ctx); _ctx = null; }
     }
 
-    /// Connect to host:port and complete the TLS handshake.
+    /// Connect to host:port and complete the TLS handshake (blocking).
     void connect(string host, ushort port)
     {
         _socket = new TcpSocket();
@@ -71,8 +80,8 @@ public:
 
         setSniHostname(_ssl, host);
 
-        int fd = cast(int) _socket.handle;
-        enforce(SSL_set_fd(_ssl, fd) == 1,
+        _fd = cast(int) _socket.handle;
+        enforce(SSL_set_fd(_ssl, _fd) == 1,
                 "SSL_set_fd failed: " ~ sslErrorString());
 
         int rc = SSL_connect(_ssl);
@@ -84,9 +93,24 @@ public:
         }
     }
 
+    /// Switch the underlying socket to non-blocking mode.
+    /// Must be called after connect().  Once set, I/O yields to the
+    /// FiberScheduler instead of blocking the OS thread.
+    void setNonBlocking()
+    {
+        import core.sys.posix.fcntl : fcntl, F_GETFL, F_SETFL, O_NONBLOCK;
+        int flags = fcntl(_fd, F_GETFL, 0);
+        fcntl(_fd, F_SETFL, flags | O_NONBLOCK);
+        _nonBlocking = true;
+    }
+
+    bool nonBlocking() @property { return _nonBlocking; }
+
     /// Send a line.  The CRLF terminator is appended automatically.
     void writeLine(string line)
     {
+        import core.thread.fiber : Fiber;
+
         string       data  = line ~ "\r\n";
         const(ubyte)[] buf = cast(const(ubyte)[]) data;
         size_t sent = 0;
@@ -96,13 +120,31 @@ public:
             int n = SSL_write(_ssl,
                               cast(const(void)*) (buf.ptr + sent),
                               cast(int) (buf.length - sent));
-            if (n <= 0)
+            if (n > 0) { sent += n; continue; }
+
+            int err = SSL_get_error(_ssl, n);
+            if (err == SSL_ERROR_WANT_WRITE)
             {
-                int err = SSL_get_error(_ssl, n);
-                throw new NntpException("SSL write failed (SSL error " ~
-                                        err.to!string ~ "): " ~ sslErrorString());
+                if (_schedulerYield !is null)
+                {
+                    _schedulerYield(_fd, true);
+                    Fiber.yield();
+                    continue;
+                }
+                throw new NntpException("SSL write: WANT_WRITE with no scheduler");
             }
-            sent += n;
+            if (err == SSL_ERROR_WANT_READ)
+            {
+                if (_schedulerYield !is null)
+                {
+                    _schedulerYield(_fd, false);
+                    Fiber.yield();
+                    continue;
+                }
+                throw new NntpException("SSL write: WANT_READ with no scheduler");
+            }
+            throw new NntpException("SSL write failed (SSL error " ~
+                                    err.to!string ~ "): " ~ sslErrorString());
         }
     }
 
@@ -147,11 +189,14 @@ public:
     {
         if (_ssl)    { SSL_free(_ssl);       _ssl    = null; }
         if (_socket) { _socket.close();      _socket = null; }
+        _nonBlocking = false;
     }
 
 private:
     void fillBuffer()
     {
+        import core.thread.fiber : Fiber;
+
         // Compact: move unconsumed data to the front.
         if (_start > 0)
         {
@@ -163,16 +208,45 @@ private:
 
         enforce(_end < _buf.length, "TLS read buffer full without finding newline");
 
-        int n = SSL_read(_ssl,
-                         cast(void*) (_buf.ptr + _end),
-                         cast(int)   (_buf.length - _end));
-        if (n <= 0)
+        while (true)
         {
+            int n = SSL_read(_ssl,
+                             cast(void*) (_buf.ptr + _end),
+                             cast(int)   (_buf.length - _end));
+            if (n > 0)
+            {
+                _end += n;
+                // Voluntary yield so other fibers can process their buffered
+                // data while ours is flowing.  The scheduler puts us straight
+                // back in _runnable (no fd wait registered).
+                if (_schedulerYield !is null) Fiber.yield();
+                return;
+            }
+
             int err = SSL_get_error(_ssl, n);
+            if (err == SSL_ERROR_WANT_READ)
+            {
+                if (_schedulerYield !is null)
+                {
+                    _schedulerYield(_fd, false);
+                    Fiber.yield();
+                    continue;
+                }
+                throw new NntpException("SSL read: WANT_READ with no scheduler");
+            }
+            if (err == SSL_ERROR_WANT_WRITE)
+            {
+                if (_schedulerYield !is null)
+                {
+                    _schedulerYield(_fd, true);
+                    Fiber.yield();
+                    continue;
+                }
+                throw new NntpException("SSL read: WANT_WRITE with no scheduler");
+            }
             throw new NntpException("SSL read failed (SSL error " ~
                                     err.to!string ~ "): " ~ sslErrorString());
         }
-        _end += n;
     }
 }
 

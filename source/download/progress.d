@@ -5,6 +5,7 @@ import std.datetime.stopwatch : StopWatch, AutoStart;
 struct SegmentProgress
 {
     uint   segsDone;
+    uint   segsError;
     uint   segsTotal;
     ulong  bytesDone;
     ulong  bytesTotal;
@@ -18,6 +19,7 @@ struct ProgressTracker
 private:
     StopWatch _sw;
     uint      _segsDone;
+    uint      _segsError;
     uint      _segsTotal;
     ulong     _bytesDone;
     ulong     _bytesTotal;
@@ -28,6 +30,7 @@ public:
         _segsTotal  = segsTotal;
         _bytesTotal = bytesTotal;
         _segsDone   = 0;
+        _segsError  = 0;
         _bytesDone  = 0;
         _sw         = StopWatch(AutoStart.yes);
     }
@@ -36,6 +39,11 @@ public:
     {
         _segsDone++;
         _bytesDone += bytes;
+    }
+
+    void segmentError()
+    {
+        _segsError++;
     }
 
     /// Update counters from atomic values read by the main thread.
@@ -49,6 +57,7 @@ public:
     {
         SegmentProgress p;
         p.segsDone   = _segsDone;
+        p.segsError  = _segsError;
         p.segsTotal  = _segsTotal;
         p.bytesDone  = _bytesDone;
         p.bytesTotal = _bytesTotal;

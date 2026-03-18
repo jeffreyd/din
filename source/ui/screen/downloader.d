@@ -17,7 +17,8 @@ import download.progress  : SegmentProgress;
 // Blocking download with a live progress screen.
 // Returns when the download is complete or failed.
 // ---------------------------------------------------------------------------
-void showDownloadProgress(ref DownloadJob job, NntpPool pool)
+void showDownloadProgress(ref DownloadJob job, NntpPool pool,
+                          bool waitForKey = true)
 {
     void redraw()
     {
@@ -43,7 +44,9 @@ void showDownloadProgress(ref DownloadJob job, NntpPool pool)
         // Progress info.
         auto p = job.progress.snapshot();
 
-        string segLine = format("  Segments : %d / %d", p.segsDone, p.segsTotal);
+        string segLine = p.segsError > 0
+            ? format("  Segments : %d / %d  (%d missing)", p.segsDone, p.segsTotal, p.segsError)
+            : format("  Segments : %d / %d", p.segsDone, p.segsTotal);
         mvprint(4, 0, segLine);
 
         double mb      = p.bytesDone  / (1024.0 * 1024.0);
@@ -118,9 +121,9 @@ void showDownloadProgress(ref DownloadJob job, NntpPool pool)
     // Run the download, redrawing after each segment.
     runJob(job, pool, &redraw);
 
-    // Final redraw and wait for keypress.
+    // Final redraw; only wait for a keypress in single-file mode.
     redraw();
-    getch();
+    if (waitForKey) getch();
 }
 
 // ---------------------------------------------------------------------------

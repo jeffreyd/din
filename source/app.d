@@ -1,9 +1,11 @@
 module app;
 
-import std.stdio     : writeln, writefln, write, stderr, stdout;
+import std.stdio     : writeln, writefln, write, stderr, stdout, File;
 import std.getopt    : getopt, defaultGetoptPrinter, GetoptResult;
 import std.path      : expandTilde;
-import std.algorithm : max;
+import std.algorithm : max, min;
+import std.format    : format;
+import std.datetime  : Clock, DateTime;
 
 import config;
 import model.server   : ServerConfig;
@@ -140,7 +142,31 @@ int main(string[] args)
     outer: while (true)
     {
         int sel = runGroupList(groups);
-        if (sel < 0) break;
+        if (sel == -1) break;
+
+        if (sel == -2)
+        {
+            // X — fetch full group list from server and write to ~/.din/groups.all.YYYY-MM-DD
+            showLoading("Fetching full group list from server...");
+            try
+            {
+                auto names = client.fetchGroupList();
+                auto now   = cast(DateTime) Clock.currTime();
+                string date = format("%04d-%02d-%02d", now.year,
+                                     cast(int) now.month, now.day);
+                string outPath = expandTilde("~/.din/groups.all." ~ date);
+                auto f = File(outPath, "w");
+                foreach (n; names)
+                    f.writeln(n);
+                f.close();
+                showError(format("Wrote %d groups to %s", names.length, outPath));
+            }
+            catch (Exception e)
+            {
+                showError("Export failed: " ~ e.msg);
+            }
+            continue;
+        }
 
         auto group = groups[sel];
 
@@ -172,7 +198,9 @@ int main(string[] args)
         while (true)
         {
             int result = runThreadList(group, items, threadCursor,
-                                       getPool(), queue, destDir);
+                                       getPool(), queue, destDir,
+                                       cfg.options.autoPar2,
+                                       cfg.options.deletePar2);
             if (result == -2) break outer;
             if (result == -1) break;
 
@@ -244,7 +272,7 @@ private Header[] syncHeaders(
 
     long from;
     if (fetchAll)
-        from = info.first;
+        from = max(info.first, info.last - 500_000 + 1);
     else if (info.last > idx.watermark)
         from = (idx.watermark > 0)
             ? idx.watermark + 1
@@ -254,8 +282,15 @@ private Header[] syncHeaders(
 
     if (from <= info.last)
     {
-        auto fresh = client.fetchHeaders(from, info.last);
-        appendHeaders(cpath, ipath, fresh);
+        enum long batchSize = 50_000L;
+        long batchFrom = from;
+        while (batchFrom <= info.last)
+        {
+            long batchTo = min(batchFrom + batchSize - 1, info.last);
+            auto fresh = client.fetchHeaders(batchFrom, batchTo);
+            appendHeaders(cpath, ipath, fresh);
+            batchFrom = batchTo + 1;
+        }
     }
 
     return loadHeaders(cpath);

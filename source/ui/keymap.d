@@ -21,6 +21,11 @@ enum Action
     Download,
     ShowDownloader,
     FetchAll,
+    Command,
+    Tag,
+    DownloadTagged,
+    RawDump,
+    ExportGroups,
 }
 
 Action keyToAction(int ch)
@@ -43,6 +48,11 @@ Action keyToAction(int ch)
         case 'd':                                return Action.Download;
         case 'D':                                return Action.ShowDownloader;
         case 'A':                                return Action.FetchAll;
+        case ':':                                return Action.Command;
+        case 't':                                return Action.Tag;
+        case 'T':                                return Action.DownloadTagged;
+        case 'R':                                return Action.RawDump;
+        case 'X':                                return Action.ExportGroups;
         default:                                 return Action.None;
     }
 }

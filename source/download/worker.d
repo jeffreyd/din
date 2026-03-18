@@ -4,13 +4,15 @@ import std.file  : mkdirRecurse;
 import std.path  : buildPath;
 import std.array : appender;
 import std.conv  : to;
+import std.stdio : File;
 
 import nntp.pool      : NntpPool;
 import binary.yenc    : decodeYenc;
 import download.queue : DownloadJob, JobState;
 
-/// Download and yEnc-decode all segments sequentially.
-/// onProgress is called after each segment so the display can refresh.
+/// Download and yEnc-decode all segments in parallel using the connection pool.
+/// Each segment is written directly to its correct byte offset (from =ypart
+/// begin=/end=) so missing or out-of-order segments never corrupt the file.
 void runJob(ref DownloadJob job, NntpPool pool,
             void delegate() onProgress = null)
 {
@@ -26,55 +28,76 @@ void runJob(ref DownloadJob job, NntpPool pool,
 
     mkdirRecurse(job.destDir);
 
-    ubyte[][] chunks;
-    chunks.length = totalSegs;
-
-    // yEnc name= from the first successfully decoded segment; preferred over
-    // the subject-derived baseName (same priority as Pan/uulib).
+    // Output file — opened on first successful decode so we have the
+    // yEnc name= and total size before creating anything on disk.
+    File   outFile;
+    bool   fileOpened = false;
+    string outPath;
     string yencName;
 
-    foreach (idx, msgId; msgIds)
-    {
-        if (msgId.length == 0) continue;
-
-        try
+    pool.fetchBodies(msgIds,
+        delegate void(size_t idx, string body)
         {
-            string body = pool.fetchBody(msgId);
-            auto   res  = decodeYenc(body);
-            chunks[idx] = res.data;
-            if (yencName.length == 0 && res.info.name.length > 0)
-                yencName = res.info.name;
-            job.progress.segmentDone(res.data.length);
+            try
+            {
+                auto res = decodeYenc(body);
+
+                // Open (and pre-allocate) the output file on first success.
+                if (!fileOpened)
+                {
+                    if (res.info.name.length > 0)
+                        yencName = res.info.name;
+                    string fname = sanitizeFname(
+                        yencName.length > 0 ? yencName : job.post.baseName);
+                    outPath   = buildPath(job.destDir, fname);
+                    outFile   = File(outPath, "wb");
+                    fileOpened = true;
+
+                    // Pre-allocate to the full file size so that holes left by
+                    // any missing segments are zero-filled rather than absent.
+                    if (res.info.size > 0)
+                    {
+                        outFile.seek(cast(long)(res.info.size) - 1);
+                        ubyte zero = 0;
+                        outFile.rawWrite((&zero)[0 .. 1]);
+                    }
+                }
+
+                // Seek to the segment's correct byte offset.
+                // =ypart begin= is 1-based; 0 means no =ypart (single-part
+                // file), so write from the start.
+                outFile.seek(res.info.begin > 0
+                    ? cast(long)(res.info.begin) - 1
+                    : 0);
+
+                outFile.rawWrite(res.data);
+
+                if (yencName.length == 0 && res.info.name.length > 0)
+                    yencName = res.info.name;
+
+                job.progress.segmentDone(res.data.length);
+            }
+            catch (Exception e)
+            {
+                job.progress.segmentError();
+                job.error = "Part " ~ (idx + 1).to!string ~ ": " ~ e.msg;
+            }
+            if (onProgress) onProgress();
+        },
+        delegate void(size_t idx, string msg)
+        {
+            job.progress.segmentError();
+            job.error = "Part " ~ (idx + 1).to!string ~ ": " ~ msg;
             if (onProgress) onProgress();
         }
-        catch (Exception e)
-        {
-            // Failed segment: leave chunks[idx] empty and continue.
-            // The incomplete file is still useful for par2 repair.
-            job.error = "Part " ~ (idx + 1).to!string ~ ": " ~ e.msg;
-            if (onProgress) onProgress();
-        }
-    }
+    );
 
-    job.state = JobState.Decoding;
-    if (onProgress) onProgress();
-
-    // Prefer yEnc name= header; fall back to subject-derived baseName.
-    string fname   = sanitizeFname(yencName.length > 0 ? yencName : job.post.baseName);
-    string outPath = buildPath(job.destDir, fname);
-
-    import std.stdio : File;
-    auto f = File(outPath, "wb");
-    // Write only the parts we have.  Missing parts are skipped entirely —
-    // the resulting incomplete file is still useful for par2 repair.
-    foreach (chunk; chunks)
+    if (fileOpened)
     {
-        if (chunk.length > 0)
-            f.rawWrite(chunk);
+        outFile.close();
+        job.decodedFiles ~= outPath;
     }
-    f.close();
 
-    job.decodedFiles ~= outPath;
     job.state = JobState.Done;
     if (onProgress) onProgress();
 }
@@ -83,12 +106,9 @@ private string sanitizeFname(string name)
 {
     import std.string : strip, lastIndexOf, indexOf;
 
-    // Prefer the last "quoted.ext" string in the subject — that's almost
-    // always the actual filename (e.g. 'Some Title - "file.mp3"').
     string s = extractQuotedFilename(name);
     if (s.length == 0)
     {
-        // Fall back to the full baseName, stripping outer quotes.
         s = name;
         if (s.length >= 2 && s[0] == '"' && s[$-1] == '"')
             s = s[1 .. $-1];
@@ -110,8 +130,6 @@ private string sanitizeFname(string name)
     return result.length > 0 ? result : "download";
 }
 
-/// Find the last "quoted string" in s that looks like a filename (has a dot,
-/// no path separators).  Returns "" if nothing suitable is found.
 private string extractQuotedFilename(string name)
 {
     import std.string : lastIndexOf, indexOf;
@@ -123,8 +141,8 @@ private string extractQuotedFilename(string name)
 
     string candidate = name[cast(size_t)(b + 1) .. cast(size_t) e];
     if (candidate.length == 0)                   return "";
-    if (indexOf(candidate, '.') < 0)             return "";  // no extension
-    if (indexOf(candidate, '/') >= 0)            return "";  // path separator
+    if (indexOf(candidate, '.') < 0)             return "";
+    if (indexOf(candidate, '/') >= 0)            return "";
     if (indexOf(candidate, '\\') >= 0)           return "";
     return candidate;
 }

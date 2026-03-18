@@ -1,7 +1,8 @@
 module binary.yenc;
 
 import std.exception : enforce;
-import std.string    : splitLines, startsWith, indexOf;
+import std.string    : startsWith, indexOf;
+import std.array     : split;
 import std.conv      : to, ConvException;
 
 struct YencInfo
@@ -26,7 +27,7 @@ struct YencResult
 /// Throws on missing =ybegin / =yend markers.
 YencResult decodeYenc(string body)
 {
-    auto lines = splitLines(body);
+    auto lines = body.split('\n');
     int  i     = 0;
 
     // Skip to =ybegin.

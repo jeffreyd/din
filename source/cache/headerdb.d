@@ -4,7 +4,7 @@ import std.file   : exists, read, write, append, mkdirRecurse;
 import std.path   : buildPath, dirName;
 import std.string : fromStringz;
 
-import nntp.commands : sanitizeUtf8;
+import nntp.commands : sanitizeUtf8, decodeRfc2047;
 
 import model.header : Header;
 
@@ -78,8 +78,8 @@ Header[] loadHeaders(string cpath)
         auto rec = *(cast(CacheRecord*) (data.ptr + i * CacheRecord.sizeof));
         h ~= Header(
             rec.number,
-            sanitizeUtf8(fromStringz(rec.subject.ptr).idup),
-            sanitizeUtf8(fromStringz(rec.from.ptr).idup),
+            sanitizeUtf8(decodeRfc2047(fromStringz(rec.subject.ptr).idup)),
+            sanitizeUtf8(decodeRfc2047(fromStringz(rec.from.ptr).idup)),
             fromStringz(rec.date.ptr).idup,
             fromStringz(rec.msgid.ptr).idup,
             "",            // references not cached (not needed until Phase 4 threading)

@@ -72,7 +72,7 @@ int runGroupList(Group[] groups)
         int statAttr = cast(int) COLOR_PAIR(ColorPair.StatusBar);
         fillLine(rows - 1, statAttr, cols);
         attron(statAttr);
-        mvprint(rows - 1, 2, "j/k:move  g/G:top/bot  Enter:open  q:quit");
+        mvprint(rows - 1, 2, "j/k:move  g/G:top/bot  Enter:open  X:export-all  q:quit");
         attroff(statAttr);
 
         refresh();
@@ -91,9 +91,10 @@ int runGroupList(Group[] groups)
             case Action.PageDown: sl.pageDown();  break;
             case Action.Top:      sl.goTop();     break;
             case Action.Bottom:   sl.goBottom();  break;
-            case Action.Select:   return sl.selected;
+            case Action.Select:       return sl.selected;
+            case Action.ExportGroups: return -2;
             case Action.Back:
-            case Action.Quit:     return -1;
+            case Action.Quit:         return -1;
             default:              break;
         }
         redraw();

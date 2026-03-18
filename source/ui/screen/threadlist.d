@@ -2,7 +2,10 @@ module ui.screen.threadlist;
 
 import std.format    : format;
 import std.algorithm : min;
-import std.string    : indexOf, toLower;
+import std.string    : indexOf, toLower, strip, startsWith;
+import std.path      : expandTilde;
+import std.file      : readText, exists, mkdirRecurse;
+import std.stdio     : File;
 
 import deimos.ncurses;
 
@@ -15,7 +18,9 @@ import ui.keymap;
 import ui.widgets.scrolllist;
 import download.queue   : DownloadQueue, DownloadJob, JobState;
 import ui.screen.downloader : showDownloadProgress, runDownloader;
-import nntp.pool : NntpPool;
+import nntp.pool   : NntpPool;
+import binary.nzb  : parseNzb;
+import binary.par2 : runPar2;
 
 // Run the thread-list screen for `group` showing `items` (assembled).
 // startAt  : restore cursor to this index (e.g. after returning from article).
@@ -27,10 +32,13 @@ import nntp.pool : NntpPool;
 //   -1    : go back to group list
 //   -2    : full quit
 int runThreadList(Group group, ThreadItem[] items, int startAt,
-                  NntpPool pool, DownloadQueue queue, string destDir)
+                  NntpPool pool, DownloadQueue queue, string destDir,
+                  bool autoPar2 = true, bool deletePar2 = false)
 {
     ScrollList sl;
     sl.reset(cast(int) items.length, startAt);
+
+    bool[] tagged = new bool[](items.length);
 
     string lastQuery;
 
@@ -143,25 +151,27 @@ int runThreadList(Group group, ThreadItem[] items, int startAt,
     // -----------------------------------------------------------------------
     // Render one thread-list row.
     // -----------------------------------------------------------------------
-    string formatTextRow(ref ThreadItem item, int cols)
+    string formatTextRow(ref ThreadItem item, int cols, bool isTagged)
     {
         auto h    = item.header;
+        string tag  = " ";
         string from = h.from.length > 20 ? h.from[0 .. 20] : h.from;
-        string line = format("%7d  %-20s  %s", h.number, from, h.subject);
+        string line = format("%s%7d  %-20s  %s", tag, h.number, from, h.subject);
         if (cast(int) line.length > cols)
             line = line[0 .. cols];
         return line;
     }
 
-    string formatBinaryRow(ref ThreadItem item, int cols)
+    string formatBinaryRow(ref ThreadItem item, int cols, bool isTagged)
     {
         auto bp = item.binary;
+        string tag   = isTagged ? "*" : " ";
         string parts = format("[%d/%d]", bp.presentParts, bp.totalParts);
         double mb    = bp.totalBytes / (1024.0 * 1024.0);
         string mbStr = format("%.1f MB", mb);
         string poster = bp.poster.length > 18 ? bp.poster[0 .. 18] : bp.poster;
-        string line = format("%-8s  %-18s  %7s  %s",
-                             parts, poster, mbStr, bp.baseName);
+        string line = format("%s%-8s  %-18s  %7s  %s",
+                             tag, parts, poster, mbStr, bp.baseName);
         if (cast(int) line.length > cols)
             line = line[0 .. cols];
         return line;
@@ -197,7 +207,7 @@ int runThreadList(Group group, ThreadItem[] items, int startAt,
 
             if (item.kind == ItemKind.Text)
             {
-                string line = formatTextRow(item, cols);
+                string line = formatTextRow(item, cols, false);
                 if (sel)
                 {
                     int a = cast(int)(COLOR_PAIR(ColorPair.Selected)) | A_BOLD;
@@ -211,7 +221,7 @@ int runThreadList(Group group, ThreadItem[] items, int startAt,
             }
             else  // Binary
             {
-                string line  = formatBinaryRow(item, cols);
+                string line  = formatBinaryRow(item, cols, tagged[i]);
                 bool complete = item.binary.isComplete;
                 int baseAttr = complete
                     ? cast(int)(COLOR_PAIR(ColorPair.Binary)) | A_BOLD
@@ -237,13 +247,223 @@ int runThreadList(Group group, ThreadItem[] items, int startAt,
         fillLine(rows - 1, sa, cols);
         attron(sa);
         string hint = statusMsg.length > 0 ? statusMsg
-            : "j/k:move  g/G:top/bot  /:search  n:next  d:dl  D:queue  A:fetch-all  Enter:open  q:back";
+            : "j/k:move  g/G:top/bot  /:search  n:next  t:tag  T:dl-tagged  d:dl  R:raw-dump  D:queue  A:all  :nzb  q:back";
         if (cast(int) hint.length > cols - 2)
             hint = hint[0 .. cols - 2];
         mvprint(rows - 1, 2, hint);
         attroff(sa);
 
         refresh();
+    }
+
+    // -----------------------------------------------------------------------
+    // Import an NZB file: parse → confirm → download all files → run par2.
+    // -----------------------------------------------------------------------
+    void doImportNzb(string path)
+    {
+        if (!exists(path))
+        {
+            redraw("NZB not found: " ~ path);
+            return;
+        }
+
+        BinaryPost[] posts;
+        try
+        {
+            posts = parseNzb(readText(path));
+        }
+        catch (Exception e)
+        {
+            showError("NZB parse error: " ~ e.msg);
+            return;
+        }
+
+        if (posts.length == 0)
+        {
+            redraw("NZB: no files found.");
+            return;
+        }
+
+        // Show confirm prompt in the status bar.
+        ulong totalBytes;
+        foreach (ref bp; posts) totalBytes += bp.totalBytes;
+        double mb = totalBytes / (1024.0 * 1024.0);
+
+        {
+            int rows = LINES;
+            int cols = COLS;
+            int sa   = cast(int) COLOR_PAIR(ColorPair.StatusBar);
+            fillLine(rows - 1, sa, cols);
+            attron(sa);
+            string prompt = format("Import %d file(s) (%.1f MB) from NZB? [y/N]: ",
+                                   posts.length, mb);
+            if (cast(int) prompt.length > cols) prompt = prompt[0 .. cols];
+            mvprint(rows - 1, 0, prompt);
+            attroff(sa);
+            curs_set(1);
+            move(rows - 1, cast(int) prompt.length);
+            refresh();
+            int ch = getch();
+            curs_set(0);
+            if (ch != 'y' && ch != 'Y') return;
+        }
+
+        // Download each file sequentially; no keypress wait between files.
+        foreach (ref bp; posts)
+        {
+            size_t idx = queue.enqueue(bp, destDir);
+            ref DownloadJob job = queue.job(idx);
+            showDownloadProgress(job, pool, false);
+        }
+
+        // Run par2 verify/repair if enabled.
+        if (autoPar2)
+        {
+            showLoading("Running par2 verify/repair...");
+            auto par2res = runPar2(destDir, deletePar2);
+            if (!par2res.success)
+            {
+                string msg = "par2 repair failed.";
+                if (par2res.output.length > 0)
+                    msg ~= "  " ~ par2res.output[$-1];
+                showError(msg);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch-download all tagged binary entries.
+    // -----------------------------------------------------------------------
+    void doDownloadTagged()
+    {
+        BinaryPost[] posts;
+        foreach (size_t i, ref item; items)
+        {
+            if (tagged[i] && item.kind == ItemKind.Binary)
+                posts ~= item.binary;
+        }
+
+        if (posts.length == 0)
+        {
+            redraw("No tagged binaries.");
+            return;
+        }
+
+        ulong totalBytes;
+        foreach (ref bp; posts) totalBytes += bp.totalBytes;
+        double mb = totalBytes / (1024.0 * 1024.0);
+
+        {
+            int rows = LINES;
+            int cols = COLS;
+            int sa   = cast(int) COLOR_PAIR(ColorPair.StatusBar);
+            fillLine(rows - 1, sa, cols);
+            attron(sa);
+            string prompt = format("Download %d tagged file(s) (%.1f MB)? [y/N]: ",
+                                   posts.length, mb);
+            if (cast(int) prompt.length > cols) prompt = prompt[0 .. cols];
+            mvprint(rows - 1, 0, prompt);
+            attroff(sa);
+            curs_set(1);
+            move(rows - 1, cast(int) prompt.length);
+            refresh();
+            int ch = getch();
+            curs_set(0);
+            if (ch != 'y' && ch != 'Y') return;
+        }
+
+        foreach (ref bp; posts)
+        {
+            size_t idx = queue.enqueue(bp, destDir);
+            ref DownloadJob job = queue.job(idx);
+            showDownloadProgress(job, pool, false);
+        }
+
+        if (autoPar2)
+        {
+            showLoading("Running par2 verify/repair...");
+            auto par2res = runPar2(destDir, deletePar2);
+            if (!par2res.success)
+            {
+                string msg = "par2 repair failed.";
+                if (par2res.output.length > 0)
+                    msg ~= "  " ~ par2res.output[$-1];
+                showError(msg);
+            }
+        }
+
+        // Clear all tags after a confirmed batch.
+        foreach (ref t; tagged) t = false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Raw-dump: fetch every segment of every tagged binary as individual
+    // files (full ARTICLE — head + body) so the raw content can be
+    // inspected.  Errors produce an empty file with -ERROR appended.
+    // -----------------------------------------------------------------------
+    void doRawDump()
+    {
+        import std.path : buildPath;
+
+        BinaryPost[] posts;
+        foreach (size_t i, ref item; items)
+            if (tagged[i] && item.kind == ItemKind.Binary)
+                posts ~= item.binary;
+
+        if (posts.length == 0)
+        {
+            redraw("No tagged binaries to raw-dump.");
+            return;
+        }
+
+        foreach (ref bp; posts)
+        {
+            string dumpDir = buildPath(destDir, bp.baseName ~ "_raw");
+            mkdirRecurse(dumpDir);
+
+            string[] msgIds = bp.messageIds;
+            int      total  = cast(int) msgIds.length;
+            int      done   = 0;
+
+            void showProgress(string extra = "")
+            {
+                int rows = LINES, cols = COLS;
+                int sa = cast(int) COLOR_PAIR(ColorPair.StatusBar);
+                fillLine(rows - 1, sa, cols);
+                attron(sa);
+                string msg = format("Raw dump [%s]: %d/%d  %s",
+                                    bp.baseName, done, total, extra);
+                if (cast(int) msg.length > cols - 2)
+                    msg = msg[0 .. cols - 2];
+                mvprint(rows - 1, 2, msg);
+                attroff(sa);
+                refresh();
+            }
+
+            showProgress();
+
+            pool.fetchBodies(msgIds,
+                delegate void(size_t idx, string body)
+                {
+                    string fname = format("seg_%04d.raw", idx + 1);
+                    auto f = File(buildPath(dumpDir, fname), "wb");
+                    f.rawWrite(cast(const(ubyte)[]) body);
+                    f.close();
+                    done++;
+                    showProgress();
+                },
+                delegate void(size_t idx, string errMsg)
+                {
+                    string fname = format("seg_%04d.raw-ERROR", idx + 1);
+                    File(buildPath(dumpDir, fname), "wb").close();
+                    done++;
+                    showProgress(errMsg);
+                },
+                true   // useArticle: fetch head+body
+            );
+        }
+
+        redraw(format("Raw dump done (%d file(s))", posts.length));
     }
 
     redraw();
@@ -278,12 +498,21 @@ int runThreadList(Group group, ThreadItem[] items, int startAt,
                 auto item = items[sl.selected];
                 if (item.kind == ItemKind.Binary)
                 {
-                    startDownload(items[sl.selected].binary);
+                    startDownload(item.binary);
                 }
                 else
                 {
-                    redraw("Not a binary.");
-                    continue;
+                    // Not assembled as binary — download the article body directly.
+                    BinaryPost bp;
+                    bp.baseName     = item.header.subject;
+                    bp.poster       = item.header.from;
+                    bp.date         = item.header.date;
+                    bp.totalParts   = 1;
+                    bp.presentParts = 1;
+                    bp.isComplete   = true;
+                    bp.messageIds   = [item.header.messageId];
+                    bp.totalBytes   = item.header.bytes;
+                    startDownload(bp);
                 }
                 break;
             }
@@ -292,9 +521,33 @@ int runThreadList(Group group, ThreadItem[] items, int startAt,
                 runDownloader(queue);
                 break;
 
+            case Action.Tag:
+            {
+                if (items[sl.selected].kind == ItemKind.Binary)
+                    tagged[sl.selected] = !tagged[sl.selected];
+                sl.moveDown();
+                break;
+            }
+
+            case Action.DownloadTagged:
+                doDownloadTagged();
+                break;
+
+            case Action.RawDump:
+                doRawDump();
+                break;
+
             case Action.FetchAll: return -3;
             case Action.Back:     return -1;
             case Action.Quit:     return -2;
+
+            case Action.Command:
+            {
+                string cmd = promptSearch(":").strip;
+                if (cmd.startsWith("nzb "))
+                    doImportNzb(expandTilde(cmd[4 .. $].strip));
+                break;
+            }
 
             case Action.Search:
             {
