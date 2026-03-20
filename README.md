@@ -1,5 +1,15 @@
 # din
 
+> **This project is abandoned.** The implementation reached a working state for
+> single-connection header fetching, binary assembly, yEnc decoding, par2
+> integration, and NZB import, but the choice of D as the implementation
+> language turned out to be a mistake. LDC (the only viable D compiler on Apple
+> Silicon) has immature threading support, and D's conservative garbage
+> collector interacts badly with C libraries (OpenSSL, ncurses) in ways that
+> are very difficult to debug. The final blocker was implementing parallel
+> header fetching using OS threads — repeated crashes from malloc double-frees
+> and GC interference that we were unable to resolve.
+
 A terminal Usenet reader for people who actually download things.
 
 `din` is a keyboard-driven, ncurses-based newsreader written in D, inspired by

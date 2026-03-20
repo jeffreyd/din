@@ -5,15 +5,17 @@ import std.format     : format;
 import std.file       : exists, mkdirRecurse, remove;
 import std.path       : dirName, buildPath;
 
-import core.thread.fiber : Fiber;
+import core.thread    : Thread;
+import core.atomic    : atomicLoad, atomicOp, atomicStore;
+import core.time      : dur;
+import core.memory    : GC;
 
 import model.server   : ServerConfig;
 import nntp.client    : NntpClient;
-import nntp.scheduler : FiberScheduler;
 import cache.headerdb : CacheAppender, mergeTempFiles;
 
 // ---------------------------------------------------------------------------
-// Progress tracking — updated from fibers (cooperative, no locks needed).
+// Progress tracking
 // ---------------------------------------------------------------------------
 
 struct HeaderFetchProgress
@@ -25,10 +27,42 @@ struct HeaderFetchProgress
 }
 
 // ---------------------------------------------------------------------------
+// Per-thread context — one heap-allocated instance per thread so each
+// delegate captures a distinct object.  Avoids LDC closure-capture bugs
+// where loop-local variables share a single frame across all iterations.
+// ---------------------------------------------------------------------------
+
+private final class ThreadCtx
+{
+    NntpClient client0;   // pre-opened connection for attempt 0
+    long       lo, hi;    // article range for this thread
+    string     tmpPath;   // temp file path for this thread
+
+    this(NntpClient c, long lo, long hi, string tp)
+    {
+        this.client0 = c;
+        this.lo      = lo;
+        this.hi      = hi;
+        this.tmpPath = tp;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Heap-allocated shared state — written by workers, read by main thread.
+// ---------------------------------------------------------------------------
+
+private final class FetchState
+{
+    shared int  batchesDone;
+    shared long articlesFetched;
+    shared int  totalFailures;
+    shared bool abort;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// scope(exit) cannot contain try/catch directly in D, so close via helpers.
 private void safeClose(NntpClient cl) nothrow
 {
     try { cl.close(); } catch (Exception) {}
@@ -43,11 +77,6 @@ private void safeCloseAppender(ref CacheAppender app) nothrow
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Fetch all articles in [from, to] for groupName using up to N parallel
-/// NNTP connections (N = server.connections).  Writes packed CacheRecords
-/// directly to per-fiber temp files which are merged into cpath when done.
-/// No Header[] is ever heap-allocated.  onProgress is called after each batch.
-/// logger (optional) receives diagnostic lines during the fetch.
 void fetchHeadersParallel(
     ServerConfig server,
     string groupName,
@@ -62,37 +91,35 @@ void fetchHeadersParallel(
 
     int n = server.connections > 0 ? server.connections : 1;
 
-    // Divide [from, to] into n contiguous chunks.
     long total   = to - from + 1;
     long perConn = (total + n - 1) / n;
 
-    struct Chunk { long lo, hi; }
-    Chunk[] chunks;
+    long[] los, his;
     {
         long cur = from;
-        while (cur <= to && cast(int) chunks.length < n)
+        while (cur <= to && cast(int) los.length < n)
         {
             long end = min(cur + perConn - 1, to);
-            chunks ~= Chunk(cur, end);
+            los ~= cur;
+            his ~= end;
             cur = end + 1;
         }
-        n = cast(int) chunks.length;
+        n = cast(int) los.length;
     }
 
-    // One temp file per fiber — written to independently, merged at the end.
     string[] tmpPaths;
     foreach (i; 0 .. n)
         tmpPaths ~= buildPath(dirName(cpath),
                               format("%s.fetch_%d.tmp", groupName, i));
 
-    // Compute total batch count for the progress bar.
     enum long batchSize = 5_000L;
-    HeaderFetchProgress prog;
-    prog.connections = n;
-    foreach (ref c; chunks)
-        prog.batchesTotal += cast(int)((c.hi - c.lo) / batchSize + 1);
+    int batchesTotal = 0;
+    foreach (i; 0 .. n)
+        batchesTotal += cast(int)((his[i] - los[i]) / batchSize + 1);
 
-    // Open one NNTP connection per fiber (blocking, before scheduler starts).
+    auto state = new FetchState();
+
+    // Open connections serially from the main thread — avoids concurrent TLS init.
     NntpClient[] clients;
     clients.length = n;
     scope (exit)
@@ -104,105 +131,154 @@ void fetchHeadersParallel(
         log(format("headerpool: opening connection %d / %d", i + 1, n));
         clients[i] = new NntpClient();
         clients[i].connect(server);
-        clients[i].setNonBlocking();
         log(format("headerpool: connection %d ready", i + 1));
     }
 
-    // Delete temps on any error so stale files don't pollute the cache.
     scope (failure)
         foreach (tp; tmpPaths)
-            if (exists(tp)) try { remove(tp); } catch (Exception) {}
-
-    // Spawn one fiber per connection and run them cooperatively.
-    log(format("headerpool: starting %d fibers, %d total batches",
-               n, prog.batchesTotal));
-    auto sched = new FiberScheduler();
-    foreach (ci; 0 .. n)
-        sched.addFiber(makeFetchFiber(
-            clients[ci], groupName,
-            chunks[ci].lo, chunks[ci].hi,
-            tmpPaths[ci], batchSize,
-            &prog, onProgress, logger));
-
-    sched.run();
-    log("headerpool: all fibers done, merging temp files");
-
-    // Merge temp files into the main cache file in range order.
-    mergeTempFiles(tmpPaths, cpath, ipath);
-    log("headerpool: merge complete");
-}
-
-// ---------------------------------------------------------------------------
-// Per-fiber worker
-// ---------------------------------------------------------------------------
-
-private Fiber makeFetchFiber(
-    NntpClient client,
-    string groupName,
-    long lo, long hi,
-    string tmpPath,
-    long batchSize,
-    HeaderFetchProgress* prog,
-    void delegate(ref HeaderFetchProgress) onProgress,
-    void delegate(string) logger)
-{
-    return new Fiber(delegate void()
-    {
-        void log(string msg) { if (logger) logger(msg); }
-
-        // Wrap the entire fiber body so no exception can escape to the
-        // scheduler (which would crash the process via f.call() re-throw).
-        try
         {
-            log(format("fiber [%d-%d]: selecting group", lo, hi));
+            if (exists(tp)) try { remove(tp); } catch (Exception) {}
+            string idx = tp ~ ".idx";
+            if (exists(idx)) try { remove(idx); } catch (Exception) {}
+        }
 
-            // Select the group first — XOVER requires it on most servers.
-            client.selectGroup(groupName);
+    log(format("headerpool: starting %d threads, %d total batches", n, batchesTotal));
 
-            log(format("fiber [%d-%d]: group selected, opening temp file", lo, hi));
+    // Disable the GC while threads run to prevent stop-the-world signals
+    // from interfering with thread startup on macOS.
+    GC.disable();
+    scope (exit) { GC.enable(); GC.collect(); }
 
-            string fakeIdx = tmpPath ~ ".idx";
-            mkdirRecurse(dirName(tmpPath));
-            auto app = CacheAppender.open(tmpPath, fakeIdx);
-            scope (exit) safeCloseAppender(app);
+    Thread[] threads;
+    threads.length = n;
 
-            long batchFrom = lo;
-            while (batchFrom <= hi)
+    foreach (ci; 0 .. n)
+    {
+        // One ThreadCtx per iteration — each delegate captures its own ctx
+        // reference, so there is no shared mutable loop-variable capture.
+        auto ctx = new ThreadCtx(clients[ci], los[ci], his[ci], tmpPaths[ci]);
+
+        threads[ci] = new Thread(delegate void()
+        {
+            int  attempt             = 0;
+            int  localBatchesDone    = 0;
+            long localArticlesFetched = 0;
+
+            while (attempt < 3)
             {
-                long  batchTo  = min(batchFrom + batchSize - 1, hi);
-                ulong savedPos = app.filePos();
+                if (atomicLoad(state.abort)) return;
+
+                // Clear the temp file before each retry.
+                if (attempt > 0)
+                {
+                    try { if (exists(ctx.tmpPath)) remove(ctx.tmpPath); } catch (Exception) {}
+                    string idxTmp = ctx.tmpPath ~ ".idx";
+                    try { if (exists(idxTmp)) remove(idxTmp); } catch (Exception) {}
+                    log(format("thread [%d-%d]: retry %d", ctx.lo, ctx.hi, attempt));
+                }
 
                 try
                 {
-                    client.fetchHeadersEach(groupName, batchFrom, batchTo,
-                        () { app.truncateToPos(savedPos); },
-                        (string line)
-                        {
-                            app.putLine(line);
-                            prog.articlesFetched++;
-                        });
+                    NntpClient client;
+                    if (attempt == 0)
+                    {
+                        client = ctx.client0;
+                        log(format("thread [%d-%d]: selecting group", ctx.lo, ctx.hi));
+                        client.selectGroup(groupName);
+                    }
+                    else
+                    {
+                        log(format("thread [%d-%d]: reconnecting", ctx.lo, ctx.hi));
+                        client = new NntpClient();
+                        client.connect(server);
+                        client.selectGroup(groupName);
+                    }
+                    scope (exit) { if (attempt > 0) safeClose(client); }
+
+                    mkdirRecurse(dirName(ctx.tmpPath));
+                    auto app = CacheAppender.open(ctx.tmpPath, ctx.tmpPath ~ ".idx");
+                    scope (exit) safeCloseAppender(app);
+
+                    long batchFrom = ctx.lo;
+                    while (batchFrom <= ctx.hi)
+                    {
+                        if (atomicLoad(state.abort)) return;
+
+                        long  batchTo  = min(batchFrom + batchSize - 1, ctx.hi);
+                        ulong savedPos = app.filePos();
+
+                        client.fetchHeadersEach(groupName, batchFrom, batchTo,
+                            () { app.truncateToPos(savedPos); },
+                            (string line)
+                            {
+                                app.putLine(line);
+                                atomicOp!"+="(state.articlesFetched, 1L);
+                                localArticlesFetched++;
+                            });
+
+                        atomicOp!"+="(state.batchesDone, 1);
+                        localBatchesDone++;
+                        batchFrom = batchTo + 1;
+                    }
+
+                    log(format("thread [%d-%d]: done", ctx.lo, ctx.hi));
+                    return;  // success
                 }
-                catch (Exception e)
+                catch (Throwable t)
                 {
-                    log(format("fiber [%d-%d]: batch %d-%d error: %s",
-                               lo, hi, batchFrom, batchTo, e.msg));
-                    app.truncateToPos(savedPos);
+                    log(format("thread [%d-%d]: attempt %d failed: %s",
+                               ctx.lo, ctx.hi, attempt + 1, t.msg));
+
+                    // Roll back this attempt's contribution to shared counters.
+                    atomicOp!"-="(state.batchesDone,     localBatchesDone);
+                    atomicOp!"-="(state.articlesFetched, localArticlesFetched);
+                    localBatchesDone     = 0;
+                    localArticlesFetched = 0;
+
+                    attempt++;
+                    int totalFails = atomicOp!"+="(state.totalFailures, 1);
+                    if (attempt >= 3 || totalFails >= 3)
+                    {
+                        log(format("thread [%d-%d]: triggering abort (totalFails=%d)",
+                                   ctx.lo, ctx.hi, totalFails));
+                        atomicStore(state.abort, true);
+                        return;
+                    }
                 }
-
-                prog.batchesDone++;
-                try { onProgress(*prog); } catch (Exception) {}
-
-                batchFrom = batchTo + 1;
             }
+        }, 8 * 1024 * 1024);
+        threads[ci].start();
+    }
 
-            log(format("fiber [%d-%d]: done, %d articles",
-                       lo, hi, prog.articlesFetched));
-        }
-        catch (Throwable t)
-        {
-            // Catches both Exception and Error (OOM, bounds, assert, etc.)
-            // so nothing can escape to the scheduler's f.call().
-            log(format("fiber [%d-%d]: fatal: %s", lo, hi, t.msg));
-        }
-    }, 512 * 1024);
+    // Progress polling — onProgress (ncurses) called only from this thread.
+    HeaderFetchProgress prog;
+    prog.connections  = n;
+    prog.batchesTotal = batchesTotal;
+
+    while (true)
+    {
+        prog.batchesDone     = atomicLoad(state.batchesDone);
+        prog.articlesFetched = atomicLoad(state.articlesFetched);
+        try { onProgress(prog); } catch (Throwable) {}
+
+        bool anyAlive = false;
+        foreach (t; threads)
+            if (t.isRunning) { anyAlive = true; break; }
+        if (!anyAlive) break;
+
+        Thread.sleep(dur!"msecs"(100));
+    }
+
+    foreach (t; threads) t.join();
+
+    prog.batchesDone     = atomicLoad(state.batchesDone);
+    prog.articlesFetched = atomicLoad(state.articlesFetched);
+    try { onProgress(prog); } catch (Throwable) {}
+
+    if (atomicLoad(state.abort))
+        throw new Exception("Header fetch failed: too many connection errors (see log)");
+
+    log("headerpool: all threads done, merging temp files");
+    mergeTempFiles(tmpPaths, cpath, ipath);
+    log("headerpool: merge complete");
 }
