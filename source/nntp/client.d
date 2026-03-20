@@ -7,9 +7,7 @@ import std.exception : enforce;
 
 import nntp.tls      : TlsSocket;
 import nntp.commands : NntpException, NntpAuthException, NntpResponseException,
-                       NntpResponse, parseResponse, GroupInfo, parseGroupInfo,
-                       parseXoverLine;
-import model.header  : Header;
+                       NntpResponse, parseResponse, GroupInfo, parseGroupInfo;
 import model.server  : ServerConfig;
 
 final class NntpClient
@@ -37,27 +35,13 @@ public:
         });
     }
 
-    /// Fetch headers for article numbers [from, to] via XOVER.  Auto-reconnects.
-    Header[] fetchHeaders(long from, long to)
-    {
-        return withRetry!(Header[])({
-            _sock.writeLine(format!"XOVER %d-%d"(from, to));
-            expect([224]);
-            Header[] headers;
-            headers.reserve(cast(size_t)(to - from + 1));
-            _sock.readMultiLineEach((string line) {
-                if (line.length > 0)
-                    headers ~= parseXoverLine(line);
-            });
-            return headers;
-        });
-    }
-
-    /// Like fetchHeaders but streams raw XOVER lines to onLine instead of
+    /// Stream raw XOVER lines to onLine instead of
     /// returning a Header[].  Zero heap allocation for the array.
     /// onRetry is called (before reconnecting) if a connection error occurs
     /// mid-stream, giving the caller a chance to roll back any partial writes.
-    void fetchHeadersEach(long from, long to,
+    /// groupName is re-sent via GROUP after reconnect so strict servers that
+    /// require a selected group before XOVER don't return 412.
+    void fetchHeadersEach(string groupName, long from, long to,
                           scope void delegate() onRetry,
                           scope void delegate(string) onLine)
     {
@@ -78,6 +62,9 @@ public:
         {
             onRetry();
             reconnect();
+            // Re-select the group; some servers require GROUP before XOVER.
+            _sock.writeLine("GROUP " ~ groupName);
+            expect([211]);
             doFetch();
         }
     }

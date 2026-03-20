@@ -30,8 +30,9 @@ import model.server   : ServerConfig;
 import model.group    : Group;
 import model.header   : Header;
 import model.thread   : ThreadItem, ItemKind;
-import nntp.client    : NntpClient;
-import nntp.pool      : NntpPool;
+import nntp.client      : NntpClient;
+import nntp.pool        : NntpPool;
+import nntp.headerpool  : fetchHeadersParallel, HeaderFetchProgress;
 import nntp.commands  : NntpException, NntpAuthException;
 import cache.headerdb;
 import cache.grouplist;
@@ -245,28 +246,38 @@ int main(string[] args)
 
             if (result == -3)
             {
-                // User pressed A — fetch all headers from the beginning.
+                // User pressed A — fetch all headers using parallel connections.
                 headers = null;
                 items   = null;
                 GC.collect();
                 GC.minimize();
-                showLoading("Fetching all headers for " ~ group.name ~ " ...");
+
+                string cpath = cachePath(cfg.options.cacheDir, server.name, group.name);
+                string ipath = indexPath(cfg.options.cacheDir, server.name, group.name);
+
+                auto info = client.selectGroup(group.name);
+                clearCache(cpath, ipath);
+
+                dbg("fetchAll parallel start: " ~ group.name);
                 try
                 {
-                    dbg("syncHeaders fetchAll start: " ~ group.name);
-                    headers = syncHeaders(client, cfg, server, group.name,
-                                         /*fetchAll=*/true);
-                    dbg(format("syncHeaders fetchAll done: %d headers", headers.length));
+                    fetchHeadersParallel(server, group.name,
+                        info.first, info.last, cpath, ipath,
+                        (ref HeaderFetchProgress p) {
+                            drawHeaderFetchProgress(group.name, p);
+                        },
+                        (string s) { dbg(s); });
                 }
                 catch (Exception e)
                 {
-                    showError("Error: " ~ e.msg);
+                    showError("Fetch error: " ~ e.msg);
                     continue;
                 }
+                dbg("fetchAll parallel done");
+
                 showLoading("Assembling thread list...");
-                dbg(format("assemble fetchAll start: %d headers", headers.length));
+                headers = loadHeaders(cpath);
                 items = assemble(headers);
-                dbg(format("assemble fetchAll done: %d items", items.length));
                 headers = null;
                 GC.collect();
                 GC.minimize();
@@ -307,12 +318,51 @@ int main(string[] args)
     return 0;
 }
 
+private void drawHeaderFetchProgress(string groupName,
+                                     ref HeaderFetchProgress p)
+{
+    import std.format    : format;
+    import std.algorithm : min;
+    import deimos.ncurses;
+
+    erase();
+
+    int ta = cast(int)(COLOR_PAIR(ColorPair.TitleBar)) | A_BOLD;
+    fillLine(0, ta, COLS);
+    attron(ta);
+    mvprint(0, 2, "din -- Fetching Headers");
+    attroff(ta);
+
+    mvprint(2, 2, "Group:       " ~ groupName);
+    mvprint(3, 2, format("Connections: %d", p.connections));
+    mvprint(5, 2, format("Batches:     %d / %d", p.batchesDone, p.batchesTotal));
+    mvprint(6, 2, format("Articles:    %d fetched", p.articlesFetched));
+
+    // Progress bar based on batches completed.
+    int barWidth = min(COLS - 6, 60);
+    if (barWidth > 4 && p.batchesTotal > 0)
+    {
+        int filled = cast(int)(
+            cast(double) p.batchesDone / p.batchesTotal * barWidth);
+        string bar = "[";
+        foreach (i; 0 .. barWidth)
+            bar ~= i < filled ? "=" : " ";
+        bar ~= "]";
+        mvprint(8, 2, bar);
+    }
+
+    // Status bar.
+    int sa = cast(int) COLOR_PAIR(ColorPair.StatusBar);
+    fillLine(LINES - 1, sa, COLS);
+
+    refresh();
+}
+
 // Fetch any new headers from the server and merge into the cache.
 // Returns all headers for the group (cached + new).
 private Header[] syncHeaders(
     NntpClient client, ref AppConfig cfg,
-    ref ServerConfig server, string groupName,
-    bool fetchAll = false)
+    ref ServerConfig server, string groupName)
 {
     GC.collect();   // release any previously loaded headers before this sync
 
@@ -323,14 +373,7 @@ private Header[] syncHeaders(
     auto info = client.selectGroup(groupName);
 
     long from;
-    if (fetchAll)
-    {
-        clearCache(cpath, ipath);
-        idx  = CacheIndex.init;
-        from = max(info.first, info.last - 500_000 + 1);
-        GC.collect();   // free any previously loaded header data before bulk fetch
-    }
-    else if (info.last > idx.watermark)
+    if (info.last > idx.watermark)
         from = (idx.watermark > 0)
             ? idx.watermark + 1
             : max(info.first, info.last - 10_000 + 1);  // initial: last 10000
@@ -339,20 +382,17 @@ private Header[] syncHeaders(
 
     if (from <= info.last)
     {
-        // Stream XOVER lines directly to the cache binary file.
-        // No Header[] or ubyte[] buf is ever heap-allocated; the conservative
-        // GC has nothing to retain between batches.
-        enum long batchSize = 50_000L;
+        enum long batchSize = 5_000L;
         auto appender = CacheAppender.open(cpath, ipath);
         long batchFrom = from;
         int  batchNum  = 0;
         while (batchFrom <= info.last)
         {
-            long batchTo  = min(batchFrom + batchSize - 1, info.last);
+            long batchTo   = min(batchFrom + batchSize - 1, info.last);
             ulong savedPos = appender.filePos();
             dbg(format("XOVER batch %d: %d..%d", batchNum, batchFrom, batchTo));
             long lineCount = 0;
-            client.fetchHeadersEach(batchFrom, batchTo,
+            client.fetchHeadersEach(groupName, batchFrom, batchTo,
                 () { appender.truncateToPos(savedPos); lineCount = 0; },
                 (string line) { appender.putLine(line); lineCount++; });
             dbg(format("XOVER batch %d: got %d lines", batchNum, lineCount));

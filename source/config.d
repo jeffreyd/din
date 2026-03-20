@@ -110,9 +110,12 @@ AppConfig loadConfig(string path = "~/.din/config")
         string key = strip(line[0 .. eq]);
         string val = strip(line[eq + 1 .. $]);
 
-        // Strip inline comments
-        auto semi = val.indexOf(';');
-        if (semi >= 0) val = strip(val[0 .. semi]);
+        // Strip inline comments, but not for pass= (passwords may contain ';').
+        if (key != "pass")
+        {
+            auto semi = val.indexOf(';');
+            if (semi >= 0) val = strip(val[0 .. semi]);
+        }
 
         if (section == "server" && inServer)
         {
@@ -122,7 +125,12 @@ AppConfig loadConfig(string path = "~/.din/config")
                     current.host = val;
                     break;
                 case "port":
-                    try { current.port = val.to!ushort; } catch (ConvException) {}
+                    try { current.port = val.to!ushort; }
+                    catch (ConvException)
+                    {
+                        import std.stdio : stderr;
+                        stderr.writefln("din: config error: invalid port value '%s' — using default", val);
+                    }
                     break;
                 case "tls":
                     current.tls = (val == "true" || val == "1" || val == "yes");

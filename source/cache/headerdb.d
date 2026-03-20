@@ -1,6 +1,6 @@
 module cache.headerdb;
 
-import std.file   : exists, read, write, append, mkdirRecurse, remove;
+import std.file   : exists, read, write, mkdirRecurse, remove;
 import std.path   : buildPath, dirName;
 import std.string : fromStringz;
 import std.stdio  : File;
@@ -203,38 +203,63 @@ Header[] loadHeaders(string cpath)
     return h;
 }
 
-void appendHeaders(string cpath, string ipath, Header[] headers)
+/// Append the raw CacheRecord bytes from tmpPaths into cpath in order,
+/// update the index watermark and count, then delete the temp files.
+/// Called by fetchHeadersParallel after all fibers complete.
+void mergeTempFiles(string[] tmpPaths, string cpath, string ipath)
 {
-    if (headers.length == 0) return;
-
     mkdirRecurse(dirName(cpath));
+    auto dest = File(cpath, "ab");
 
-    auto idx    = readIndex(ipath);
-    long maxNum = idx.watermark;
+    long count  = 0;
+    long maxNum = 0;
 
+    // Copy each temp file in fixed-size chunks so we never read an entire
+    // (potentially multi-GB) temp file into memory at once.
+    enum size_t chunkRecords = 10_000;
+    enum size_t chunkBytes   = chunkRecords * CacheRecord.sizeof;
     ubyte[] buf;
-    buf.reserve(headers.length * CacheRecord.sizeof);
+    buf.length = chunkBytes;
 
-    foreach (ref h; headers)
+    foreach (tp; tmpPaths)
     {
-        if (h.number > maxNum) maxNum = h.number;
+        if (!exists(tp)) continue;
 
-        CacheRecord rec;
-        rec.number = h.number;
-        rec.bytes  = h.bytes;
-        rec.lines  = h.lines;
-        copyStr(rec.msgid[],   h.messageId);
-        copyStr(rec.from[],    h.from);
-        copyStr(rec.date[],    h.date);
-        copyStr(rec.subject[], h.subject);
+        auto src = File(tp, "rb");
+        while (true)
+        {
+            auto slice = src.rawRead(buf);
+            if (slice.length == 0) break;
 
-        buf ~= (cast(ubyte*) &rec)[0 .. CacheRecord.sizeof];
+            // Align to a whole record boundary (server can't send partial records,
+            // but be defensive).
+            size_t aligned = (slice.length / CacheRecord.sizeof) * CacheRecord.sizeof;
+            if (aligned == 0) break;
+
+            dest.rawWrite(slice[0 .. aligned]);
+
+            size_t nrec = aligned / CacheRecord.sizeof;
+            count += cast(long) nrec;
+            for (size_t i = 0; i < nrec; i++)
+            {
+                auto rec = *(cast(CacheRecord*)(slice.ptr + i * CacheRecord.sizeof));
+                if (rec.number > maxNum) maxNum = rec.number;
+            }
+        }
+        src.close();
+
+        try { remove(tp); } catch (Exception) {}
+
+        // Remove the companion .idx written by the fiber's CacheAppender.
+        string idxTmp = tp ~ ".idx";
+        if (exists(idxTmp)) try { remove(idxTmp); } catch (Exception) {}
     }
 
-    append(cpath, cast(void[]) buf);
+    dest.close();
 
-    idx.watermark  = maxNum;
-    idx.count     += cast(long) headers.length;
+    CacheIndex idx = readIndex(ipath);
+    if (maxNum > idx.watermark) idx.watermark = maxNum;
+    idx.count += count;
     writeIndex(ipath, idx);
 }
 

@@ -109,7 +109,7 @@ ThreadItem[] assemble(Header[] headers)
         }
 
         BinaryGroup* g = key in groupMap;
-        // Keep the smallest totalParts seen (subject lines sometimes disagree).
+        // Keep the largest totalParts seen (subject lines sometimes disagree).
         if (totalParts > g.totalParts)
             g.totalParts = totalParts;
         if (h.number < g.firstArticleNum)

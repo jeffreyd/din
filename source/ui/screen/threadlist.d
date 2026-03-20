@@ -481,6 +481,7 @@ int runThreadList(Group group, ThreadItem[] items, int startAt,
             case Action.Bottom:   sl.goBottom();  break;
 
             case Action.Select:
+                if (items.length == 0) break;
                 if (items[sl.selected].kind == ItemKind.Binary)
                 {
                     // Confirm then download.
@@ -495,6 +496,7 @@ int runThreadList(Group group, ThreadItem[] items, int startAt,
 
             case Action.Download:
             {
+                if (items.length == 0) break;
                 auto item = items[sl.selected];
                 if (item.kind == ItemKind.Binary)
                 {
@@ -523,6 +525,7 @@ int runThreadList(Group group, ThreadItem[] items, int startAt,
 
             case Action.Tag:
             {
+                if (items.length == 0) break;
                 if (items[sl.selected].kind == ItemKind.Binary)
                     tagged[sl.selected] = !tagged[sl.selected];
                 sl.moveDown();
