@@ -44,11 +44,42 @@ public:
             _sock.writeLine(format!"XOVER %d-%d"(from, to));
             expect([224]);
             Header[] headers;
-            foreach (line; _sock.readMultiLine())
+            headers.reserve(cast(size_t)(to - from + 1));
+            _sock.readMultiLineEach((string line) {
                 if (line.length > 0)
                     headers ~= parseXoverLine(line);
+            });
             return headers;
         });
+    }
+
+    /// Like fetchHeaders but streams raw XOVER lines to onLine instead of
+    /// returning a Header[].  Zero heap allocation for the array.
+    /// onRetry is called (before reconnecting) if a connection error occurs
+    /// mid-stream, giving the caller a chance to roll back any partial writes.
+    void fetchHeadersEach(long from, long to,
+                          scope void delegate() onRetry,
+                          scope void delegate(string) onLine)
+    {
+        void doFetch()
+        {
+            _sock.writeLine(format!"XOVER %d-%d"(from, to));
+            expect([224]);
+            _sock.readMultiLineEach(onLine);
+        }
+
+        try
+        {
+            doFetch();
+        }
+        catch (NntpAuthException e)    { throw e; }
+        catch (NntpResponseException e){ throw e; }
+        catch (Exception)
+        {
+            onRetry();
+            reconnect();
+            doFetch();
+        }
     }
 
     /// Fetch the body of a single article by message-id.  Auto-reconnects.

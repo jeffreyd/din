@@ -16,6 +16,7 @@ struct AppOptions
     string cacheDir;
     int    maxHeaderAgeDays   = 30;
     string editor;
+    string logFile;           // if non-empty, debug log is written here
 }
 
 struct AppConfig
@@ -160,6 +161,9 @@ AppConfig loadConfig(string path = "~/.din/config")
                     break;
                 case "editor":
                     cfg.options.editor = val;
+                    break;
+                case "log_file":
+                    cfg.options.logFile = expandTilde(val);
                     break;
                 default:
                     break;

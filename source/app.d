@@ -5,7 +5,25 @@ import std.getopt    : getopt, defaultGetoptPrinter, GetoptResult;
 import std.path      : expandTilde;
 import std.algorithm : max, min;
 import std.format    : format;
-import std.datetime  : Clock, DateTime;
+import std.datetime  : Clock, DateTime, SysTime;
+import core.memory   : GC;
+
+// ---------------------------------------------------------------------------
+// Debug logging — only active when cfg.options.logFile is non-empty.
+// Opens the file lazily on first use; appends across calls.
+// ---------------------------------------------------------------------------
+private File   _logFile;
+private string _logPath;
+
+private void dbg(string msg)
+{
+    if (_logPath.length == 0) return;
+    if (!_logFile.isOpen) _logFile = File(_logPath, "a");
+    auto ts = cast(DateTime) Clock.currTime();
+    _logFile.writefln("[%02d:%02d:%02d] %s",
+                      ts.hour, ts.minute, ts.second, msg);
+    _logFile.flush();
+}
 
 import config;
 import model.server   : ServerConfig;
@@ -50,6 +68,7 @@ int main(string[] args)
 
     // --- config ---
     auto cfg = loadConfig(configPath);
+    _logPath = cfg.options.logFile;   // empty string = logging disabled
     if (cfg.servers.length == 0)
     {
         stderr.writeln("No servers configured.  Create ~/.din/config (see README.md).");
@@ -139,6 +158,12 @@ int main(string[] args)
     tuiInit();
     scope (exit) tuiShutdown();
 
+    // Declared here so we can explicitly null them before each reload,
+    // letting the GC actually reclaim the memory (conservative GC won't
+    // collect data that still has a live stack reference).
+    Header[]    headers;
+    ThreadItem[] items;
+
     outer: while (true)
     {
         int sel = runGroupList(groups);
@@ -170,13 +195,20 @@ int main(string[] args)
 
         auto group = groups[sel];
 
+        // Release any previously loaded group data before fetching new ones.
+        headers = null;
+        items   = null;
+        GC.collect();
+        GC.minimize();
+
         // Fetch / update header cache for this group.
         showLoading("Fetching headers for " ~ group.name ~ " ...");
 
-        Header[] headers;
         try
         {
+            dbg("syncHeaders start: " ~ group.name);
             headers = syncHeaders(client, cfg, server, group.name);
+            dbg(format("syncHeaders done: %d headers", headers.length));
             groups[sel].unread = 0;
         }
         catch (NntpException e)
@@ -192,7 +224,14 @@ int main(string[] args)
 
         // Assemble headers into unified thread+binary list.
         showLoading("Assembling thread list...");
-        ThreadItem[] items = assemble(headers);
+        dbg(format("assemble start: %d headers", headers.length));
+        items = assemble(headers);
+        dbg(format("assemble done: %d items", items.length));
+        // headers is no longer needed — release before entering the TUI loop
+        // so the GC can reclaim ~300 MB while we still hold a named reference.
+        headers = null;
+        GC.collect();
+        GC.minimize();
 
         int threadCursor = 0;
         while (true)
@@ -207,11 +246,17 @@ int main(string[] args)
             if (result == -3)
             {
                 // User pressed A — fetch all headers from the beginning.
+                headers = null;
+                items   = null;
+                GC.collect();
+                GC.minimize();
                 showLoading("Fetching all headers for " ~ group.name ~ " ...");
                 try
                 {
+                    dbg("syncHeaders fetchAll start: " ~ group.name);
                     headers = syncHeaders(client, cfg, server, group.name,
                                          /*fetchAll=*/true);
+                    dbg(format("syncHeaders fetchAll done: %d headers", headers.length));
                 }
                 catch (Exception e)
                 {
@@ -219,7 +264,12 @@ int main(string[] args)
                     continue;
                 }
                 showLoading("Assembling thread list...");
+                dbg(format("assemble fetchAll start: %d headers", headers.length));
                 items = assemble(headers);
+                dbg(format("assemble fetchAll done: %d items", items.length));
+                headers = null;
+                GC.collect();
+                GC.minimize();
                 continue;
             }
 
@@ -264,6 +314,8 @@ private Header[] syncHeaders(
     ref ServerConfig server, string groupName,
     bool fetchAll = false)
 {
+    GC.collect();   // release any previously loaded headers before this sync
+
     string cpath = cachePath(cfg.options.cacheDir, server.name, groupName);
     string ipath = indexPath(cfg.options.cacheDir, server.name, groupName);
 
@@ -272,7 +324,12 @@ private Header[] syncHeaders(
 
     long from;
     if (fetchAll)
+    {
+        clearCache(cpath, ipath);
+        idx  = CacheIndex.init;
         from = max(info.first, info.last - 500_000 + 1);
+        GC.collect();   // free any previously loaded header data before bulk fetch
+    }
     else if (info.last > idx.watermark)
         from = (idx.watermark > 0)
             ? idx.watermark + 1
@@ -282,16 +339,31 @@ private Header[] syncHeaders(
 
     if (from <= info.last)
     {
+        // Stream XOVER lines directly to the cache binary file.
+        // No Header[] or ubyte[] buf is ever heap-allocated; the conservative
+        // GC has nothing to retain between batches.
         enum long batchSize = 50_000L;
+        auto appender = CacheAppender.open(cpath, ipath);
         long batchFrom = from;
+        int  batchNum  = 0;
         while (batchFrom <= info.last)
         {
-            long batchTo = min(batchFrom + batchSize - 1, info.last);
-            auto fresh = client.fetchHeaders(batchFrom, batchTo);
-            appendHeaders(cpath, ipath, fresh);
+            long batchTo  = min(batchFrom + batchSize - 1, info.last);
+            ulong savedPos = appender.filePos();
+            dbg(format("XOVER batch %d: %d..%d", batchNum, batchFrom, batchTo));
+            long lineCount = 0;
+            client.fetchHeadersEach(batchFrom, batchTo,
+                () { appender.truncateToPos(savedPos); lineCount = 0; },
+                (string line) { appender.putLine(line); lineCount++; });
+            dbg(format("XOVER batch %d: got %d lines", batchNum, lineCount));
             batchFrom = batchTo + 1;
+            batchNum++;
         }
+        appender.close();
     }
 
-    return loadHeaders(cpath);
+    dbg("loadHeaders start: " ~ cpath);
+    auto result = loadHeaders(cpath);
+    dbg(format("loadHeaders done: %d records", result.length));
+    return result;
 }

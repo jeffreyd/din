@@ -128,11 +128,11 @@ Header parseXoverLine(string line)
     }
 
     if (fields.length > 0) h.number     = safeLong(0);
-    if (fields.length > 1) h.subject    = sanitizeUtf8(decodeRfc2047(fields[1]));
-    if (fields.length > 2) h.from       = sanitizeUtf8(decodeRfc2047(fields[2]));
-    if (fields.length > 3) h.date       = fields[3];
-    if (fields.length > 4) h.messageId  = fields[4];
-    if (fields.length > 5) h.references = fields[5];
+    if (fields.length > 1) h.subject    = sanitizeUtf8(decodeRfc2047(fields[1])).idup;
+    if (fields.length > 2) h.from       = sanitizeUtf8(decodeRfc2047(fields[2])).idup;
+    if (fields.length > 3) h.date       = fields[3].idup;
+    if (fields.length > 4) h.messageId  = fields[4].idup;
+    if (fields.length > 5) h.references = fields[5].idup;
     if (fields.length > 6) h.bytes      = cast(ulong) safeLong(6);
     if (fields.length > 7) h.lines      = safeUint(7);
 

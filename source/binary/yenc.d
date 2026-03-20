@@ -76,7 +76,7 @@ private:
 YencInfo parseYbegin(string line)
 {
     YencInfo h;
-    h.name  = tagValue(line, "name");
+    h.name  = tagValue(line, "name", true);
     string s = tagValue(line, "size");  if (s.length) h.size  = safeToUlong(s);
     string p = tagValue(line, "part");  if (p.length) h.part  = safeToUint(p);
     string t = tagValue(line, "total"); if (t.length) h.total = safeToUint(t);
@@ -104,7 +104,9 @@ uint extractCrc(string line)
 }
 
 /// Extract value of key=value from a yEnc header line.
-string tagValue(string line, string key)
+/// Set toEndOfLine=true for the name= field, which extends to end of line
+/// and may contain spaces (unlike all other yEnc header fields).
+string tagValue(string line, string key, bool toEndOfLine = false)
 {
     string needle = key ~ "=";
     auto   pos    = line.indexOf(needle);
@@ -116,6 +118,14 @@ string tagValue(string line, string key)
         rest = rest[1 .. $];
         auto end = rest.indexOf('"');
         return end >= 0 ? rest[0 .. end] : rest;
+    }
+    if (toEndOfLine)
+    {
+        // Strip trailing whitespace / carriage return.
+        size_t end = rest.length;
+        while (end > 0 && (rest[end - 1] == '\r' || rest[end - 1] == ' ' || rest[end - 1] == '\t'))
+            end--;
+        return rest[0 .. end];
     }
     size_t end = 0;
     while (end < rest.length && rest[end] != ' ' && rest[end] != '\t')

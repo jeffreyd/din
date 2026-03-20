@@ -4,7 +4,7 @@ import std.algorithm : sort, canFind;
 import std.array     : appender;
 import std.string    : strip, toLower, indexOf;
 import std.conv      : to, ConvException;
-import std.regex     : regex, matchFirst, Regex;
+import std.regex     : regex, matchFirst, matchAll, Regex;
 
 import model.header : Header;
 import model.binary : BinaryPost;
@@ -52,34 +52,41 @@ ThreadItem[] assemble(Header[] headers)
 
     foreach (ref h; headers)
     {
-        auto m = matchFirst(h.subject, partRe);
-        if (m.empty)
+        // Find all (N/M) / [N/M] tokens and pick the one with the largest M.
+        // Some subjects carry both a collection indicator like [2/4] and a
+        // per-file segment counter like (50/52).  matchFirst would grab the
+        // first token, leaving the other in the base name and breaking grouping.
+        size_t bestPre    = 0;
+        size_t bestHit    = 0;
+        uint   partNum    = 0;
+        uint   totalParts = 0;
+        bool   foundMatch = false;
+
+        foreach (m2; matchAll(h.subject, partRe))
+        {
+            uint pn, tp;
+            try { pn = m2[1].to!uint; tp = m2[2].to!uint; }
+            catch (ConvException) { continue; }
+            if (pn == 0 || tp == 0 || pn > tp) continue;
+            if (!foundMatch || tp > totalParts)
+            {
+                bestPre    = m2.pre.length;
+                bestHit    = m2.hit.length;
+                partNum    = pn;
+                totalParts = tp;
+                foundMatch = true;
+            }
+        }
+
+        if (!foundMatch)
         {
             textItems ~= ThreadItem(ItemKind.Text, h);
             continue;
         }
 
-        uint partNum, totalParts;
-        try
-        {
-            partNum    = m[1].to!uint;
-            totalParts = m[2].to!uint;
-        }
-        catch (ConvException)
-        {
-            textItems ~= ThreadItem(ItemKind.Text, h);
-            continue;
-        }
-
-        if (partNum == 0 || totalParts == 0 || partNum > totalParts)
-        {
-            textItems ~= ThreadItem(ItemKind.Text, h);
-            continue;
-        }
-
-        // Strip the matched token from the subject to derive the base name.
-        string pre  = h.subject[0 .. m.pre.length].strip;
-        string post = h.subject[m.pre.length + m.hit.length .. $].strip;
+        // Strip the best-matched token from the subject to derive the base name.
+        string pre  = h.subject[0 .. bestPre].strip;
+        string post = h.subject[bestPre + bestHit .. $].strip;
         string base = (pre.length > 0 && post.length > 0) ? pre ~ " " ~ post
                     : (pre.length > 0 ? pre : post);
         base = stripYencKeyword(base).strip;

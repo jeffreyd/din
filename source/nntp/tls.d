@@ -185,6 +185,22 @@ public:
         return lines;
     }
 
+    /// Like readMultiLine but invokes callback for each line instead of
+    /// accumulating a string[].  The line is only alive during the callback,
+    /// so the GC can reclaim it immediately — critical for large XOVER responses.
+    void readMultiLineEach(scope void delegate(string) callback)
+    {
+        while (true)
+        {
+            string line = readLine();
+            if (line == ".")
+                break;
+            if (line.length > 0 && line[0] == '.')
+                line = line[1 .. $];   // dot-unstuffing
+            callback(line);
+        }
+    }
+
     void close()
     {
         if (_ssl)    { SSL_free(_ssl);       _ssl    = null; }
